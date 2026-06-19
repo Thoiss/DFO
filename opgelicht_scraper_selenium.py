@@ -1,6 +1,6 @@
 """
-Scraper voor opgelicht.nl - Alerts overzicht (Selenium-versie)
-===============================================================
+Scraper voor opgelicht.nl - Alerts overzicht (Selenium-versie + Chain of Custody)
+===================================================================================
 Doel: per alert ophalen welke platforms/bedrijven worden genoemd,
 samen met datum en categorie, t.b.v. analyse in Kibana.
 
@@ -11,12 +11,25 @@ Hybride aanpak:
     om de details (datum, tags, ...) op te halen. Dit is veel sneller
     dan voor elke detailpagina opnieuw een browser te openen.
 
+NIEUW in deze versie: Chain of Custody (CoC) borging
+  - Elke run krijgt een uniek run-ID en start-/eindtijd (met timezone).
+  - Het outputbestand krijgt een SHA-256 hash, opgeslagen in een los
+    .sha256 bestand zodat je kunt aantonen dat de data niet is gewijzigd.
+  - Elke run wordt toegevoegd aan een doorlopend logbestand (run_log.csv)
+    dat gebruikt wordt voor het CoC-logboek.
+  - Een screenshot van de overzichtspagina wordt automatisch opgeslagen
+    als forensisch bewijs van wat er op het moment van scrapen te zien was.
+
 Auteur: Thijs (HSL)
 """
 
+import csv
+import hashlib
+import json
 import random
 import time
-import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
@@ -44,7 +57,8 @@ MAX_CLICKS = 5
 HEADLESS = False
 
 # User-Agent voor de requests-call op detailpagina's (we doen ons voor
-# als een normale browser; chain of custody borgen we via GitHub-log).
+# als een normale browser; chain of custody borgen we via dit logbestand
+# en GitHub-commits van de scraper-code zelf).
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -54,7 +68,56 @@ HEADERS = {
     "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
 }
 
-OUTPUT_FILE = "opgelicht_alerts.json"
+# --- CoC: outputmap structuur -----------------------------------------------
+# Alles wat met één run te maken heeft (data + hash + screenshot) krijgt
+# dezelfde RUN_ID in de bestandsnaam, zodat alles bij elkaar traceerbaar is.
+
+OUTPUT_DIR = Path("coc_output")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")  # bv. 20260619_143200
+OUTPUT_FILE = OUTPUT_DIR / f"opgelicht_alerts_{RUN_ID}.json"
+HASH_FILE = OUTPUT_DIR / f"opgelicht_alerts_{RUN_ID}.sha256"
+SCREENSHOT_FILE = OUTPUT_DIR / f"screenshot_overview_{RUN_ID}.png"
+RUN_LOG_FILE = OUTPUT_DIR / "run_log.csv"
+
+
+# --- CoC: hulpfuncties voor hashing en logging ------------------------------
+
+def sha256_of_file(path: Path) -> str:
+    """
+    Berekent de SHA-256 hash van een bestand in blokken (geheugenvriendelijk,
+    ook bij grote datasets). Deze hash bewijst dat het bestand na het
+    scrapen niet (per ongeluk of opzettelijk) is aangepast.
+    """
+    sha256 = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            sha256.update(block)
+    return sha256.hexdigest()
+
+
+def log_run(run_info: dict) -> None:
+    """
+    Schrijft één regel toe aan run_log.csv (doorlopend logbestand).
+    Dit bestand kun je direct gebruiken om je Word CoC-logboek mee te vullen:
+    elke regel hier komt overeen met één "Logboek entry" in dat document.
+    """
+    file_exists = RUN_LOG_FILE.exists()
+    with open(RUN_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(run_info.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(run_info)
+
+
+def take_screenshot(driver, path: Path) -> None:
+    """Slaat een screenshot van de huidige browserstaat op als bewijsmateriaal."""
+    try:
+        driver.save_screenshot(str(path))
+        print(f"    [✓] Screenshot opgeslagen: {path}")
+    except Exception as e:
+        print(f"    [!] Screenshot mislukt: {e}")
 
 
 # --- Stap 1: Selenium - alle alert-URLs verzamelen --------------------------
@@ -78,20 +141,19 @@ def collect_alert_urls_selenium() -> list[str]:
         driver.get(ALERTS_URL)
         time.sleep(2)  # initiële laadtijd
 
+        # CoC: screenshot van de startsituatie, vóór er geklikt wordt
+        take_screenshot(driver, SCREENSHOT_FILE)
+
         for i in range(1, MAX_CLICKS + 1):
-            # Tel hoeveel alert-links er momenteel zichtbaar zijn
             before = len(driver.find_elements(
                 By.XPATH, "//a[contains(@href, '/alerts/')]"
             ))
             print(f"[{i}/{MAX_CLICKS}] Zichtbaar: {before} alert-links — zoeken naar 'Toon meer'")
 
             try:
-                # De knop staat onderaan de lijst; we zoeken op tekstinhoud.
                 button = driver.find_element(
                     By.XPATH, "//*[normalize-space(text())='Toon meer']"
                 )
-                # Scroll de knop in beeld voordat we klikken (anders kan
-                # een sticky header de klik tegenhouden).
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block: 'center'});", button
                 )
@@ -101,13 +163,11 @@ def collect_alert_urls_selenium() -> list[str]:
                 print("    [✓] Geen 'Toon meer' knop meer — alle alerts geladen")
                 break
             except ElementClickInterceptedException:
-                # Soms zit een cookie-banner ervoor; in dat geval handmatig
-                # wegklikken in de zichtbare browser en het script gaat verder
                 print("    [!] Klik geblokkeerd (cookie-banner?). Probeer handmatig weg te klikken.")
                 time.sleep(5)
                 continue
 
-            # Wacht tot nieuwe items zijn ingeladen
+            # CoC: onvoorspelbaarheid - random wachttijd i.p.v. vaste interval
             time.sleep(random.uniform(1.5, 2.5))
 
             after = len(driver.find_elements(
@@ -117,7 +177,6 @@ def collect_alert_urls_selenium() -> list[str]:
                 print("    [✓] Geen nieuwe alerts meer ingeladen — stoppen")
                 break
 
-        # Pak de finale HTML van de pagina en haal er alle alert-URLs uit
         soup = BeautifulSoup(driver.page_source, "html.parser")
         urls = set()
         for a in soup.find_all("a", href=True):
@@ -177,9 +236,15 @@ def scrape_alert_page(url: str) -> dict:
     }
 
 
-# --- Hoofdprogramma ---------------------------------------------------------
+# --- Hoofdprogramma ----------------------------------------------------------
 
 def main():
+    # CoC: starttijd vastleggen, met timezone, vóórdat er iets gebeurt
+    start_time = datetime.now(timezone.utc).astimezone()
+    print(f"[CoC] Run gestart: {start_time.isoformat()} (RUN_ID={RUN_ID})\n")
+
+    errors = []
+
     # Stap 1: alle URLs verzamelen via de echte browser
     alert_urls = collect_alert_urls_selenium()
     print(f"\n[+] Totaal {len(alert_urls)} unieke alert-URLs verzameld\n")
@@ -192,13 +257,47 @@ def main():
             results.append(scrape_alert_page(url))
         except Exception as e:
             print(f"    [!] Fout: {e}")
+            errors.append(f"{url} -> {e}")
+        # CoC: onvoorspelbaarheid - random sleep tussen requests
         time.sleep(random.uniform(1.0, 2.0))
 
-    # Opslaan
+    # Opslaan van de data
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-
     print(f"\n[✓] Klaar: {len(results)} alerts opgeslagen in '{OUTPUT_FILE}'")
+
+    # --- CoC: hash berekenen over het ZOJUIST opgeslagen bestand ---
+    file_hash = sha256_of_file(OUTPUT_FILE)
+    with open(HASH_FILE, "w", encoding="utf-8") as f:
+        f.write(f"{file_hash}  {OUTPUT_FILE.name}\n")
+    print(f"[CoC] SHA-256: {file_hash}")
+    print(f"[CoC] Hash opgeslagen in: {HASH_FILE}")
+
+    # CoC: eindtijd vastleggen
+    end_time = datetime.now(timezone.utc).astimezone()
+
+    # CoC: alles samenvoegen tot één logregel
+    run_info = {
+        "run_id": RUN_ID,
+        "start_tijd": start_time.isoformat(timespec="seconds"),
+        "eind_tijd": end_time.isoformat(timespec="seconds"),
+        "duur_seconden": round((end_time - start_time).total_seconds()),
+        "max_clicks": MAX_CLICKS,
+        "aantal_urls_gevonden": len(alert_urls),
+        "aantal_records_opgeslagen": len(results),
+        "aantal_errors": len(errors),
+        "output_bestand": OUTPUT_FILE.name,
+        "sha256": file_hash,
+        "screenshot": SCREENSHOT_FILE.name,
+        "user_agent": HEADERS["User-Agent"],
+        "fouten": " | ".join(errors) if errors else "",
+    }
+    log_run(run_info)
+    print(f"[CoC] Run gelogd in: {RUN_LOG_FILE}")
+
+    print("\n--- Samenvatting voor je CoC-logboek (Word document) ---")
+    for key, value in run_info.items():
+        print(f"  {key}: {value}")
 
 
 if __name__ == "__main__":
