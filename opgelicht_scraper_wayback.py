@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import random
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -160,13 +161,72 @@ def collect_urls_from_wayback() -> list[str]:
     return sorted(urls)
 
 
+def normalize_slug(url: str) -> str:
+    """
+    Normaliseert een alert-URL naar een vergelijkbare 'kale' slug, zodat
+    we duplicaten kunnen herkennen tussen de oude URL-structuur
+    (/alerts/artikel/<slug>) en de nieuwe (/alerts/<slug>-<id>).
+
+    Voorbeeld:
+      /alerts/aantal-valse-mails-is-vervijfvoudigd-11302   -> aantal-valse-mails-is-vervijfvoudigd
+      /alerts/artikel/aantal-valse-mails-is-vervijfvoudigd -> aantal-valse-mails-is-vervijfvoudigd
+
+    Let op: dit is een BESTE-POGING normalisatie op tekst, geen garantie.
+    Sommige oude/nieuwe slug-paren verschillen net iets in spelling (bv.
+    '...voor-40000-opgelicht' vs '...voor-eur40000-opgelicht'), en die
+    worden hier NIET als duplicaat herkend. Die gevallen vangen we pas
+    af bij het scrapen zelf, via de uiteindelijke redirect-URL
+    (zie scrape_alert_page()).
+    """
+    path = url.split("/alerts/", 1)[-1]
+    if path.startswith("artikel/"):
+        path = path[len("artikel/"):]
+    # Verwijder een numeriek ID-suffix aan het einde, bv. '-11302'
+    path = re.sub(r"-\d+$", "", path)
+    return path.rstrip("/")
+
+
+def dedupe_urls_by_slug(urls: list[str]) -> list[str]:
+    """
+    Filtert een lijst van URLs zodat per genormaliseerde slug (zie
+    normalize_slug()) maar één URL overblijft. Bij een duplicaat
+    geven we voorkeur aan de NIEUWE URL-vorm (/alerts/<slug>-<id>,
+    dus zonder '/artikel/'), omdat die direct (zonder redirect) laadt.
+
+    Dit voorkomt dat we straks twee keer dezelfde pagina-inhoud
+    scrapen (één keer via een omleiding) voor exact hetzelfde artikel.
+    """
+    best_url_per_slug: dict[str, str] = {}
+    for url in urls:
+        slug = normalize_slug(url)
+        is_old_style = "/alerts/artikel/" in url
+        if slug not in best_url_per_slug:
+            best_url_per_slug[slug] = url
+        elif is_old_style is False:
+            # Nieuwe URL-vorm heeft voorrang over een eerder gevonden
+            # oude (/artikel/) vorm voor dezelfde slug.
+            best_url_per_slug[slug] = url
+
+    deduped = sorted(best_url_per_slug.values())
+    removed = len(urls) - len(deduped)
+    if removed > 0:
+        print(f"    [i] {removed} vermoedelijke duplicaten verwijderd "
+              f"op basis van genormaliseerde slug")
+    return deduped
+
+
 # --- Stap 2: BeautifulSoup - elke detailpagina parsen -----------------------
 
-def fetch_html(url: str) -> BeautifulSoup:
-    """Haal de HTML van een URL op en parse die met BeautifulSoup."""
+def fetch_html(url: str) -> tuple[BeautifulSoup, str]:
+    """
+    Haal de HTML van een URL op en parse die met BeautifulSoup.
+    Geeft ook de UITEINDELIJKE URL terug (na eventuele redirects), zodat
+    we de canonieke URL kunnen opslaan i.p.v. de mogelijk-verouderde
+    '/alerts/artikel/...'-vorm waarmee we begonnen.
+    """
     response = requests.get(url, headers=HEADERS, timeout=15)
     response.raise_for_status()
-    return BeautifulSoup(response.content, "html.parser")
+    return BeautifulSoup(response.content, "html.parser"), response.url
 
 
 def parse_published_date(soup: BeautifulSoup) -> datetime | None:
@@ -197,7 +257,7 @@ def scrape_alert_page(url: str) -> dict | None:
     er geen publicatiedatum te vinden is. Dit voorkomt dat 2026-artikelen
     (buiten scope) alsnog in de dataset terechtkomen.
     """
-    soup = fetch_html(url)
+    soup, final_url = fetch_html(url)
 
     datum_dt = parse_published_date(soup)
     if datum_dt is None:
@@ -230,7 +290,7 @@ def scrape_alert_page(url: str) -> dict | None:
                 tags.append(tekst)
 
     return {
-        "url": url,
+        "url": final_url.rstrip("/"),
         "titel": titel,
         "datum": datum,
         "beschrijving": beschrijving,
@@ -251,7 +311,15 @@ def main():
     print(f"[resumable] {len(seen_urls)} URLs eerder al bekeken (uit {SEEN_URLS_FILE.name})\n")
 
     # Stap 1: alle historische URLs via Wayback
-    all_urls_now = collect_urls_from_wayback()
+    all_urls_raw = collect_urls_from_wayback()
+
+    # Dedupe op basis van genormaliseerde slug: voorkomt dat we straks
+    # twee keer dezelfde pagina scrapen via /alerts/<slug>-<id> EN
+    # /alerts/artikel/<slug> (de oude URL-structuur die server-side
+    # naar de nieuwe wordt geredirect).
+    all_urls_now = dedupe_urls_by_slug(all_urls_raw)
+    print(f"[+] {len(all_urls_now)} unieke URLs over na slug-dedupe "
+          f"(was {len(all_urls_raw)})\n")
 
     # Resumable: alleen nieuwe URLs daadwerkelijk bezoeken
     new_urls = [u for u in all_urls_now if u not in seen_urls]
