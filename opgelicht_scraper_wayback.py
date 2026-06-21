@@ -1,0 +1,324 @@
+"""
+
+Auteur: Thijs (HSL)
+"""
+
+import csv
+import hashlib
+import json
+import random
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+
+# --- Configuratie -----------------------------------------------------------
+
+BASE_URL = "https://opgelicht.avrotros.nl"
+ALERTS_URL = f"{BASE_URL}/alerts"
+
+# Wayback CDX Server API - gratis, geen API-key nodig.
+# We vragen alle gearchiveerde URLs op die beginnen met /alerts/
+WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
+
+# Onderzoeksscope: alleen artikelen met een publicatiedatum binnen dit
+# bereik komen in de dataset. Artikelen erbuiten (bv. 2026) worden
+# tijdens het scrapen overgeslagen - zie scrape_alert_page().
+SCOPE_START = datetime(2022, 1, 1, tzinfo=timezone.utc)
+SCOPE_END = datetime(2025, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+
+# User-Agent voor de requests-calls (Wayback CDX API + live detailpagina's).
+# We doen ons voor als een normale browser; chain of custody borgen we via
+# dit logbestand en GitHub-commits van de scraper-code zelf.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+}
+
+# --- CoC: outputmap structuur -----------------------------------------------
+
+OUTPUT_DIR = Path("coc_output")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")  # bv. 20260620_143200
+OUTPUT_FILE = OUTPUT_DIR / f"opgelicht_alerts_{RUN_ID}.json"
+HASH_FILE = OUTPUT_DIR / f"opgelicht_alerts_{RUN_ID}.sha256"
+RUN_LOG_FILE = OUTPUT_DIR / "run_log.csv"
+
+# Resumable scraping: dit bestand onthoudt over ALLE runs heen welke
+# URLs al gescraped zijn. Geen RUN_ID in de naam, want dit bestand
+# blijft bestaan en groeit met elke run.
+SEEN_URLS_FILE = OUTPUT_DIR / "seen_urls.json"
+
+
+# --- CoC: hulpfuncties voor hashing en logging ------------------------------
+
+def sha256_of_file(path: Path) -> str:
+    """
+    Berekent de SHA-256 hash van een bestand in blokken (geheugenvriendelijk,
+    ook bij grote datasets). Deze hash bewijst dat het bestand na het
+    scrapen niet (per ongeluk of opzettelijk) is aangepast.
+    """
+    sha256 = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            sha256.update(block)
+    return sha256.hexdigest()
+
+
+def log_run(run_info: dict) -> None:
+    """
+    Schrijft één regel toe aan run_log.csv (doorlopend logbestand).
+    Dit bestand kun je direct gebruiken om je Word CoC-logboek mee te vullen.
+    """
+    file_exists = RUN_LOG_FILE.exists()
+    with open(RUN_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(run_info.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(run_info)
+
+
+# --- Resumable: hulpfuncties voor seen_urls.json ----------------------------
+
+def load_seen_urls() -> set[str]:
+    """Leest seen_urls.json in; lege set als het bestand nog niet bestaat."""
+    if not SEEN_URLS_FILE.exists():
+        return set()
+    with open(SEEN_URLS_FILE, "r", encoding="utf-8") as f:
+        return set(json.load(f))
+
+
+def save_seen_urls(seen_urls: set[str]) -> None:
+    """Schrijft de (bijgewerkte) set van geziene URLs terug naar schijf."""
+    with open(SEEN_URLS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen_urls), f, ensure_ascii=False, indent=2)
+
+
+# --- Stap 1a: Wayback CDX API - historische URLs verzamelen ----------------
+
+def collect_urls_from_wayback() -> list[str]:
+    """
+    Vraagt de Wayback Machine CDX API om alle gearchiveerde URLs die
+    beginnen met opgelicht.avrotros.nl/alerts/.
+
+    BELANGRIJK: de 'timestamp' die deze API teruggeeft is het moment
+    waarop het Internet Archive de pagina heeft gecrawld/gefotografeerd -
+    NIET de publicatiedatum van het artikel. We gebruiken die timestamp
+    dan ook niet; we gebruiken ALLEEN de 'original' URL. De echte
+    publicatiedatum wordt later, in scrape_alert_page(), uit de live
+    pagina gehaald (meta-tag 'article:published_time'). Dat is ook waar
+    de daadwerkelijke scope-filtering (2022-2025) plaatsvindt.
+
+    We vragen daarom alleen 'original' (de live URL) op, en gebruiken
+    collapse=urlkey zodat elke unieke URL maar één keer terugkomt (een
+    pagina kan meerdere keren gearchiveerd zijn, met verschillende
+    timestamps die voor ons doel irrelevant zijn).
+    """
+    print("[+] Wayback CDX API bevragen voor historische alert-URLs...")
+    params = {
+        "url": f"{BASE_URL.replace('https://', '')}/alerts/*",
+        "output": "json",
+        "fl": "original,timestamp",
+        "collapse": "urlkey",
+    }
+    try:
+        response = requests.get(
+            WAYBACK_CDX_URL, params=params, headers=HEADERS, timeout=60
+        )
+        response.raise_for_status()
+        rows = response.json()
+    except Exception as e:
+        print(f"    [!] Wayback CDX API-aanroep mislukt: {e}")
+        return []
+
+    if not rows or len(rows) < 2:
+        print("    [!] Geen resultaten van Wayback CDX API")
+        return []
+
+    # Eerste rij is de header (kolomnamen), de rest zijn de data
+    header, *data_rows = rows
+    url_index = header.index("original")
+
+    urls = set()
+    for row in data_rows:
+        url = row[url_index]
+        # Alleen daadwerkelijke alert-detailpagina's, niet /alerts zelf
+        if "/alerts/" in url and not url.rstrip("/").endswith("/alerts"):
+            # Wayback bewaart soms http:// en https:// varianten, en
+            # soms met/zonder trailing slash -> normaliseren naar https.
+            normalized = url.replace("http://", "https://").rstrip("/")
+            urls.add(normalized)
+
+    print(f"    [✓] {len(urls)} unieke historische alert-URLs gevonden via Wayback")
+    return sorted(urls)
+
+
+# --- Stap 2: BeautifulSoup - elke detailpagina parsen -----------------------
+
+def fetch_html(url: str) -> BeautifulSoup:
+    """Haal de HTML van een URL op en parse die met BeautifulSoup."""
+    response = requests.get(url, headers=HEADERS, timeout=15)
+    response.raise_for_status()
+    return BeautifulSoup(response.content, "html.parser")
+
+
+def parse_published_date(soup: BeautifulSoup) -> datetime | None:
+    """
+    Leest de publicatiedatum uit de 'article:published_time' meta-tag
+    en zet die om naar een timezone-aware datetime, zodat we 'm kunnen
+    vergelijken met SCOPE_START / SCOPE_END.
+    """
+    date_meta = soup.find("meta", attrs={"property": "article:published_time"})
+    if not date_meta or not date_meta.get("content"):
+        return None
+    raw = date_meta["content"]
+    try:
+        # Formaat: '2026-04-15T15:51:13.467Z' -> ISO 8601 met Z voor UTC.
+        # Python's fromisoformat kent 'Z' niet rechtstreeks, dus vervangen
+        # we die door '+00:00'.
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def scrape_alert_page(url: str) -> dict | None:
+    """
+    Scrape één alert-detailpagina en geef een gestructureerde dict terug.
+
+    Geeft None terug (en scraped dus NIETS) als de publicatiedatum
+    buiten de onderzoeksscope (SCOPE_START - SCOPE_END) valt, of als
+    er geen publicatiedatum te vinden is. Dit voorkomt dat 2026-artikelen
+    (buiten scope) alsnog in de dataset terechtkomen.
+    """
+    soup = fetch_html(url)
+
+    datum_dt = parse_published_date(soup)
+    if datum_dt is None:
+        print(f"    [!] Geen publicatiedatum gevonden — overgeslagen")
+        return None
+    if not (SCOPE_START <= datum_dt <= SCOPE_END):
+        print(f"    [-] Buiten scope ({datum_dt.date()}) — overgeslagen")
+        return None
+
+    datum = datum_dt.isoformat()
+
+    h1 = soup.find("h1")
+    titel = h1.get_text(strip=True) if h1 else None
+
+    desc_meta = soup.find("meta", attrs={"name": "description"})
+    beschrijving = desc_meta["content"] if desc_meta else None
+
+    onderwerpen = []
+    for a in soup.find_all("a", href=True):
+        if "/onderwerpen/" in a["href"]:
+            tekst = a.get_text(strip=True)
+            if tekst and tekst not in onderwerpen:
+                onderwerpen.append(tekst)
+
+    tags = []
+    for a in soup.find_all("a", href=True):
+        if "/tags/" in a["href"]:
+            tekst = a.get_text(strip=True)
+            if tekst and tekst not in tags:
+                tags.append(tekst)
+
+    return {
+        "url": url,
+        "titel": titel,
+        "datum": datum,
+        "beschrijving": beschrijving,
+        "onderwerpen": onderwerpen,
+        "tags": tags,
+    }
+
+
+# --- Hoofdprogramma ----------------------------------------------------------
+
+def main():
+    start_time = datetime.now(timezone.utc).astimezone()
+    print(f"[CoC] Run gestart: {start_time.isoformat()} (RUN_ID={RUN_ID})\n")
+
+    errors = []
+
+    seen_urls = load_seen_urls()
+    print(f"[resumable] {len(seen_urls)} URLs eerder al bekeken (uit {SEEN_URLS_FILE.name})\n")
+
+    # Stap 1: alle historische URLs via Wayback
+    all_urls_now = collect_urls_from_wayback()
+
+    # Resumable: alleen nieuwe URLs daadwerkelijk bezoeken
+    new_urls = [u for u in all_urls_now if u not in seen_urls]
+    print(f"[resumable] Daarvan zijn {len(new_urls)} URLs nieuw t.o.v. vorige runs\n")
+
+    if not new_urls:
+        print("[i] Geen nieuwe alerts gevonden.")
+
+    # Stap 2: per nieuwe URL de live detailpagina scrapen, met datumfilter.
+    # scrape_alert_page() geeft None terug bij buiten-scope of ontbrekende
+    # datum - die URLs slaan we niet op in de dataset, maar WEL in
+    # seen_urls.json (anders checkt het script ze elke run opnieuw).
+    results = []
+    skipped_out_of_scope = 0
+    bezochte_urls = []
+    for i, url in enumerate(new_urls, 1):
+        print(f"[{i}/{len(new_urls)}] Scrapen: {url}")
+        bezochte_urls.append(url)
+        try:
+            record = scrape_alert_page(url)
+            if record is None:
+                skipped_out_of_scope += 1
+            else:
+                results.append(record)
+        except Exception as e:
+            print(f"    [!] Fout: {e}")
+            errors.append(f"{url} -> {e}")
+        time.sleep(random.uniform(1.0, 2.0))
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"\n[✓] Klaar: {len(results)} nieuwe alerts binnen scope opgeslagen in '{OUTPUT_FILE}'")
+    print(f"    {skipped_out_of_scope} URLs overgeslagen (buiten scope of geen datum)")
+
+    seen_urls.update(bezochte_urls)
+    save_seen_urls(seen_urls)
+    print(f"[resumable] {SEEN_URLS_FILE.name} bijgewerkt — totaal nu {len(seen_urls)} URLs bekend")
+
+    file_hash = sha256_of_file(OUTPUT_FILE)
+    with open(HASH_FILE, "w", encoding="utf-8") as f:
+        f.write(f"{file_hash}  {OUTPUT_FILE.name}\n")
+    print(f"[CoC] SHA-256: {file_hash}")
+
+    end_time = datetime.now(timezone.utc).astimezone()
+
+    run_info = {
+        "run_id": RUN_ID,
+        "start_tijd": start_time.isoformat(timespec="seconds"),
+        "eind_tijd": end_time.isoformat(timespec="seconds"),
+        "duur_seconden": round((end_time - start_time).total_seconds()),
+        "wayback_urls_totaal": len(all_urls_now),
+        "aantal_urls_nieuw_bezocht": len(new_urls),
+        "aantal_records_binnen_scope": len(results),
+        "aantal_overgeslagen_buiten_scope": skipped_out_of_scope,
+        "aantal_errors": len(errors),
+        "output_bestand": OUTPUT_FILE.name,
+        "sha256": file_hash,
+        "user_agent": HEADERS["User-Agent"],
+        "fouten": " | ".join(errors) if errors else "",
+    }
+    log_run(run_info)
+    print(f"[CoC] Run gelogd in: {RUN_LOG_FILE}")
+
+    print("\n--- Samenvatting voor je CoC-logboek (Word document) ---")
+    for key, value in run_info.items():
+        print(f"  {key}: {value}")
+
+
+if __name__ == "__main__":
+    main()
