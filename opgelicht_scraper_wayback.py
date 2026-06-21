@@ -217,16 +217,41 @@ def dedupe_urls_by_slug(urls: list[str]) -> list[str]:
 
 # --- Stap 2: BeautifulSoup - elke detailpagina parsen -----------------------
 
-def fetch_html(url: str) -> tuple[BeautifulSoup, str]:
+def fetch_html(url: str, max_retries: int = 3) -> tuple[BeautifulSoup, str]:
     """
     Haal de HTML van een URL op en parse die met BeautifulSoup.
     Geeft ook de UITEINDELIJKE URL terug (na eventuele redirects), zodat
     we de canonieke URL kunnen opslaan i.p.v. de mogelijk-verouderde
     '/alerts/artikel/...'-vorm waarmee we begonnen.
+
+    Bij HTTP 429 (Too Many Requests) wordt de 'Retry-After' header van
+    de server gerespecteerd (de server geeft hiermee zelf aan hoe lang
+    je moet wachten). Is die header niet aanwezig, dan wachten we
+    oplopend langer per poging (exponential backoff: 10s, 20s, 40s).
+    Na max_retries mislukte pogingen geven we de fout door aan de
+    aanroeper, die de URL dan als 'tijdelijk mislukt' registreert
+    (zie main()) zodat een volgende run het opnieuw probeert.
     """
-    response = requests.get(url, headers=HEADERS, timeout=15)
+    for attempt in range(1, max_retries + 1):
+        response = requests.get(url, headers=HEADERS, timeout=15)
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                wait = int(retry_after)
+            else:
+                wait = 10 * (2 ** (attempt - 1))  # 10s, 20s, 40s
+            print(f"    [!] 429 Too Many Requests (poging {attempt}/{max_retries}), "
+                  f"{wait}s wachten...")
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        return BeautifulSoup(response.content, "html.parser"), response.url
+
+    # Alle retries op 429 uitgeput -> alsnog de fout opwerpen, zodat
+    # main() dit als tijdelijke fout (niet als 'definitief klaar') ziet.
     response.raise_for_status()
-    return BeautifulSoup(response.content, "html.parser"), response.url
 
 
 def parse_published_date(soup: BeautifulSoup) -> datetime | None:
@@ -330,22 +355,41 @@ def main():
 
     # Stap 2: per nieuwe URL de live detailpagina scrapen, met datumfilter.
     # scrape_alert_page() geeft None terug bij buiten-scope of ontbrekende
-    # datum - die URLs slaan we niet op in de dataset, maar WEL in
-    # seen_urls.json (anders checkt het script ze elke run opnieuw).
+    # datum. We onderscheiden twee soorten 'mislukt':
+    #   - DEFINITIEF (404, geen datum, buiten scope): de URL gaat WEL in
+    #     seen_urls.json, want een volgende run hoeft dit niet opnieuw
+    #     te proberen - het antwoord verandert niet.
+    #   - TIJDELIJK (429 Too Many Requests, timeout, verbindingsfout): de
+    #     URL gaat NIET in seen_urls.json, zodat een volgende run hem
+    #     automatisch opnieuw oppakt.
     results = []
     skipped_out_of_scope = 0
-    bezochte_urls = []
+    definitief_afgehandeld = []   # -> wel in seen_urls.json
+    tijdelijk_mislukt = []        # -> niet in seen_urls.json, opnieuw proberen
+
+    # Foutmeldingen waarvan we weten dat herhalen waarschijnlijk weer
+    # lukt na een tijdje (rate limiting, server tijdelijk overbelast,
+    # netwerk-hikje) - deze URLs NIET als definitief markeren.
+    TIJDELIJKE_FOUT_SIGNALEN = ("429", "503", "Timeout", "ConnectionError")
+
     for i, url in enumerate(new_urls, 1):
         print(f"[{i}/{len(new_urls)}] Scrapen: {url}")
-        bezochte_urls.append(url)
         try:
             record = scrape_alert_page(url)
+            definitief_afgehandeld.append(url)
             if record is None:
                 skipped_out_of_scope += 1
             else:
                 results.append(record)
         except Exception as e:
-            print(f"    [!] Fout: {e}")
+            error_text = str(e)
+            is_tijdelijk = any(signaal in error_text for signaal in TIJDELIJKE_FOUT_SIGNALEN)
+            if is_tijdelijk:
+                print(f"    [!] Tijdelijke fout (volgende run opnieuw proberen): {e}")
+                tijdelijk_mislukt.append(url)
+            else:
+                print(f"    [!] Definitieve fout: {e}")
+                definitief_afgehandeld.append(url)
             errors.append(f"{url} -> {e}")
         time.sleep(random.uniform(1.0, 2.0))
 
@@ -353,8 +397,13 @@ def main():
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"\n[✓] Klaar: {len(results)} nieuwe alerts binnen scope opgeslagen in '{OUTPUT_FILE}'")
     print(f"    {skipped_out_of_scope} URLs overgeslagen (buiten scope of geen datum)")
+    print(f"    {len(tijdelijk_mislukt)} URLs tijdelijk mislukt — worden bij volgende run opnieuw geprobeerd")
 
-    seen_urls.update(bezochte_urls)
+    # Alleen definitief afgehandelde URLs gaan in seen_urls.json.
+    # Tijdelijk mislukte URLs blijven 'onbekend', zodat de volgende
+    # keer dat je dit script draait ze automatisch opnieuw worden
+    # opgepakt door de resumable-logica (new_urls-filter hierboven).
+    seen_urls.update(definitief_afgehandeld)
     save_seen_urls(seen_urls)
     print(f"[resumable] {SEEN_URLS_FILE.name} bijgewerkt — totaal nu {len(seen_urls)} URLs bekend")
 
@@ -374,6 +423,7 @@ def main():
         "aantal_urls_nieuw_bezocht": len(new_urls),
         "aantal_records_binnen_scope": len(results),
         "aantal_overgeslagen_buiten_scope": skipped_out_of_scope,
+        "aantal_tijdelijk_mislukt": len(tijdelijk_mislukt),
         "aantal_errors": len(errors),
         "output_bestand": OUTPUT_FILE.name,
         "sha256": file_hash,
